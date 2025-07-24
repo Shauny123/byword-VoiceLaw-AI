@@ -1,0 +1,513 @@
+# nginx/nginx.conf
+# High-performance load balancer and reverse proxy for VoiceLaw-AI
+# Optimized for WebSocket connections, file uploads, and SSL termination
+
+# Global configuration
+user nginx;
+worker_processes auto;
+worker_rlimit_nofile 65535;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+# Events block - optimized for high concurrency
+events {
+    worker_connections 4096;
+    use epoll;
+    multi_accept on;
+    accept_mutex off;
+}
+
+# HTTP block
+http {
+    # Basic settings
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    charset utf-8;
+    
+    # Performance optimizations
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 1000;
+    types_hash_max_size 2048;
+    server_tokens off;
+    
+    # File size limits for audio uploads
+    client_max_body_size 100M;
+    client_body_buffer_size 128k;
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+    
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 6;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/json
+        application/javascript
+        application/xml+rss
+        application/atom+xml
+        image/svg+xml;
+    
+    # Logging format
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" '
+                    'rt=$request_time uct="$upstream_connect_time" '
+                    'uht="$upstream_header_time" urt="$upstream_response_time"';
+    
+    access_log /var/log/nginx/access.log main;
+    
+    # Rate limiting zones
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=upload_limit:10m rate=2r/s;
+    limit_req_zone $binary_remote_addr zone=ws_limit:10m rate=5r/s;
+    
+    # Connection limiting
+    limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:10m;
+    limit_conn_zone $server_name zone=conn_limit_per_server:10m;
+    
+    # Upstream servers for load balancing
+    upstream voicelaw_ai_api {
+        least_conn;
+        server api:8000 max_fails=3 fail_timeout=30s;
+        # Add more API instances for scaling
+        # server api-2:8000 max_fails=3 fail_timeout=30s;
+        # server api-3:8000 max_fails=3 fail_timeout=30s;
+        # server api-4:8000 max_fails=3 fail_timeout=30s;
+        # server api-5:8000 max_fails=3 fail_timeout=30s;
+        
+        # Health check
+        keepalive 32;
+        keepalive_requests 100;
+        keepalive_timeout 60s;
+    }
+    
+    # WebSocket upstream for real-time voice connections
+    upstream voicelaw_ai_websocket {
+        ip_hash;  # Sticky sessions for WebSocket connections
+        server api:8000 max_fails=3 fail_timeout=30s;
+        # server api-2:8000 max_fails=3 fail_timeout=30s;
+        # server api-3:8000 max_fails=3 fail_timeout=30s;
+    }
+    
+    # Monitoring upstream
+    upstream monitoring {
+        server grafana:3000;
+    }
+    
+    # Cache settings
+    proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=static_cache:10m max_size=1g inactive=60m use_temp_path=off;
+    proxy_cache_path /var/cache/nginx/api levels=1:2 keys_zone=api_cache:10m max_size=100m inactive=10m use_temp_path=off;
+    
+    # Security headers map
+    map $sent_http_content_type $content_security_policy {
+        ~^text/html "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'; media-src 'self' blob:";
+    }
+    
+    # ===================================================================
+    # HTTP to HTTPS Redirect
+    # ===================================================================
+    
+    server {
+        listen 80;
+        listen [::]:80;
+        server_name _;
+        
+        # Security headers for HTTP
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        
+        # Health check without redirect (for load balancers)
+        location /health {
+            proxy_pass http://voicelaw_ai_api/api/health;
+            proxy_set_header Host $host;
+            access_log off;
+        }
+        
+        # Let's Encrypt ACME challenge
+        location /.well-known/acme-challenge/ {
+            root /var/www/certbot;
+        }
+        
+        # Redirect all other traffic to HTTPS
+        location / {
+            return 301 https://$host$request_uri;
+        }
+    }
+    
+    # ===================================================================
+    # Development Server (when SSL is not available)
+    # ===================================================================
+    
+    server {
+        listen 8080;
+        server_name localhost;
+        
+        # Development-only configuration
+        access_log /var/log/nginx/dev_access.log main;
+        
+        # Allow larger uploads in development
+        client_max_body_size 200M;
+        
+        # API routes
+        location /api/ {
+            proxy_pass http://voicelaw_ai_api;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # Development timeouts
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+        }
+        
+        # WebSocket routes
+        location /ws/ {
+            proxy_pass http://voicelaw_ai_websocket;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+        
+        # Frontend
+        location / {
+            proxy_pass http://frontend:3000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            
+            # WebSocket support for development hot reload
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+    }
+    
+    # ===================================================================
+    # Load Balancer Health Check
+    # ===================================================================
+    
+    server {
+        listen 8081;
+        server_name _;
+        access_log off;
+        
+        location /health {
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+        
+        location / {
+            return 404;
+        }
+    }
+}
+
+# ===================================================================
+# Stream block for TCP/UDP load balancing (if needed)
+# ===================================================================
+
+stream {
+    # Log format for stream
+    log_format stream '$remote_addr [$time_local] $protocol $status $bytes_sent $bytes_received $session_time';
+    
+    # Access log
+    access_log /var/log/nginx/stream_access.log stream;
+    
+    # Example: PostgreSQL load balancing
+    # upstream postgres_pool {
+    #     server postgres:5432 max_fails=3 fail_timeout=30s;
+    #     server postgres-replica:5432 max_fails=3 fail_timeout=30s backup;
+    # }
+    # 
+    # server {
+    #     listen 5432;
+    #     proxy_pass postgres_pool;
+    #     proxy_timeout 1s;
+    #     proxy_responses 1;
+    #     error_log /var/log/nginx/postgres_proxy.log;
+    # }
+    
+    # Example: Redis load balancing
+    # upstream redis_pool {
+    #     server redis:6379 max_fails=3 fail_timeout=30s;
+    #     server redis-replica:6379 max_fails=3 fail_timeout=30s backup;
+    # }
+    # 
+    # server {
+    #     listen 6379;
+    #     proxy_pass redis_pool;
+    #     proxy_timeout 1s;
+    #     proxy_responses 1;
+    #     error_log /var/log/nginx/redis_proxy.log;
+    # }
+}
+    # SSL/TLS Configuration
+    # ===================================================================
+    
+    # SSL settings
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
+    
+    # OCSP stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+    resolver_timeout 5s;
+    
+    # ===================================================================
+    # Main Server Block (HTTPS)
+    # ===================================================================
+    
+    server {
+        listen 443 ssl http2;
+        listen [::]:443 ssl http2;
+        server_name _;  # Replace with your domain: voicelaw-ai.yourdomain.com
+        
+        # SSL certificate configuration
+        # For production, replace with real certificates:
+        # ssl_certificate /etc/nginx/ssl/fullchain.pem;
+        # ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+        # ssl_trusted_certificate /etc/nginx/ssl/chain.pem;
+        
+        # For development/testing with self-signed certificates
+        ssl_certificate /etc/nginx/ssl/nginx-selfsigned.crt;
+        ssl_certificate_key /etc/nginx/ssl/nginx-selfsigned.key;
+        
+        # Security headers
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy $content_security_policy always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+        
+        # Rate limiting
+        limit_req zone=api_limit burst=20 nodelay;
+        limit_conn conn_limit_per_ip 20;
+        limit_conn conn_limit_per_server 1000;
+        
+        # ===================================================================
+        # API Routes
+        # ===================================================================
+        
+        # Main API endpoint
+        location /api/ {
+            proxy_pass http://voicelaw_ai_api;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Port $server_port;
+            
+            # Timeouts
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+            
+            # Buffer settings
+            proxy_buffering on;
+            proxy_buffer_size 4k;
+            proxy_buffers 8 4k;
+            proxy_busy_buffers_size 8k;
+            
+            # Cache for static API responses
+            proxy_cache api_cache;
+            proxy_cache_valid 200 302 10m;
+            proxy_cache_valid 404 1m;
+            proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+            proxy_cache_background_update on;
+            proxy_cache_lock on;
+            
+            # Cache bypass for dynamic content
+            proxy_cache_bypass $http_pragma $http_authorization;
+            proxy_no_cache $http_pragma $http_authorization;
+            
+            # Add cache status header
+            add_header X-Cache-Status $upstream_cache_status always;
+        }
+        
+        # File upload endpoint with higher limits
+        location /api/voice/transcribe {
+            limit_req zone=upload_limit burst=5 nodelay;
+            
+            proxy_pass http://voicelaw_ai_api;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # Extended timeouts for file processing
+            proxy_connect_timeout 120s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+            
+            # Disable caching for uploads
+            proxy_cache off;
+            
+            # Request body settings
+            client_max_body_size 100M;
+            client_body_buffer_size 1M;
+            proxy_request_buffering off;
+        }
+        
+        # ===================================================================
+        # WebSocket Routes
+        # ===================================================================
+        
+        # WebSocket endpoint for voice conversations
+        location /ws/ {
+            limit_req zone=ws_limit burst=10 nodelay;
+            
+            proxy_pass http://voicelaw_ai_websocket;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # WebSocket specific timeouts
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+            proxy_connect_timeout 60s;
+            
+            # Disable buffering for real-time communication
+            proxy_buffering off;
+            proxy_cache off;
+        }
+        
+        # ===================================================================
+        # Static Content & Frontend
+        # ===================================================================
+        
+        # Frontend application
+        location / {
+            root /usr/share/nginx/html;
+            index index.html index.htm;
+            try_files $uri $uri/ /index.html;
+            
+            # Cache static assets
+            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                add_header X-Content-Type-Options "nosniff" always;
+                
+                # Enable compression
+                gzip_static on;
+            }
+            
+            # HTML files - short cache
+            location ~* \.html$ {
+                expires 1h;
+                add_header Cache-Control "public, must-revalidate";
+                add_header X-Content-Type-Options "nosniff" always;
+            }
+        }
+        
+        # ===================================================================
+        # Health Checks & Monitoring
+        # ===================================================================
+        
+        # Health check endpoint
+        location /health {
+            access_log off;
+            proxy_pass http://voicelaw_ai_api/api/health;
+            proxy_set_header Host $host;
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 5s;
+        }
+        
+        # Nginx status for monitoring
+        location /nginx_status {
+            stub_status on;
+            access_log off;
+            allow 127.0.0.1;
+            allow 172.16.0.0/12;  # Docker networks
+            deny all;
+        }
+        
+        # Monitoring dashboard
+        location /monitoring/ {
+            proxy_pass http://monitoring/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+        
+        # Prometheus metrics endpoint
+        location /metrics {
+            proxy_pass http://voicelaw_ai_api/metrics;
+            proxy_set_header Host $host;
+            access_log off;
+            allow 127.0.0.1;
+            allow 172.16.0.0/12;  # Docker networks
+            deny all;
+        }
+        
+        # ===================================================================
+        # Security & Error Handling
+        # ===================================================================
+        
+        # Hide server information
+        location ~ /\. {
+            deny all;
+            access_log off;
+            log_not_found off;
+        }
+        
+        # Block access to sensitive files
+        location ~* \.(env|log|ini|conf|yml|yaml|json)$ {
+            deny all;
+            access_log off;
+            log_not_found off;
+        }
+        
+        # Block access to backup files
+        location ~* \.(bak|backup|old|orig|save|tmp)$ {
+            deny all;
+            access_log off;
+            log_not_found off;
+        }
+        
+        # Custom error pages
+        error_page 404 /404.html;
+        error_page 500 502 503 504 /50x.html;
+        
+        location = /50x.html {
+            root /usr/share/nginx/html;
+            internal;
+        }
+        
+        location = /404.html {
+            root /usr/share/nginx/html;
+            internal;
+        }
+    }
+    
+    # ===================================================================
+    
