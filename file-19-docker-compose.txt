@@ -1,0 +1,620 @@
+# docker-compose.yml
+# Complete orchestration for VoiceLaw-AI Legal Intake System
+# Production-ready with monitoring, scaling, and data persistence
+
+version: '3.8'
+
+# ===================================================================
+# SHARED CONFIGURATIONS
+# ===================================================================
+
+x-common-variables: &common-variables
+  DATABASE_URL: postgresql://legal_ai:${POSTGRES_PASSWORD:-secure_password_123}@postgres:5432/legal_intake
+  REDIS_URL: redis://redis:6379
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# ===================================================================
+# NETWORKS
+# ===================================================================
+
+networks:
+  voicelaw-ai-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+  monitoring:
+    driver: bridge
+
+# ===================================================================
+# VOLUMES
+# ===================================================================
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  voicelaw_ai_cache:
+    driver: local
+  voicelaw_ai_logs:
+    driver: local
+  voicelaw_ai_uploads:
+    driver: local
+  podgpt_models:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  nginx_cache:
+    driver: local
+
+# ===================================================================
+# SERVICES
+# ===================================================================
+
+services:
+
+  # ===================================================================
+  # CORE APPLICATION SERVICES
+  # ===================================================================
+
+  # Main API Service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        TARGETARCH: ${TARGETARCH:-amd64}
+    image: voicelaw-ai:latest
+    container_name: voicelaw-ai-api
+    <<: *restart-policy
+    <<: *logging
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      <<: *common-variables
+      FASTAPI_WORKERS: ${API_WORKERS:-4}
+      WHISPER_MODEL_PATH: /app/cache/whisper
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      FASTAPI_HOST: "0.0.0.0"
+      FASTAPI_PORT: "8000"
+    volumes:
+      - voicelaw_ai_cache:/app/cache
+      - voicelaw_ai_logs:/app/logs
+      - voicelaw_ai_uploads:/app/uploads
+      - podgpt_models:/app/data
+    networks:
+      - voicelaw-ai-network
+      - monitoring
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+        reservations:
+          memory: 2G
+          cpus: '1'
+
+  # Load Balancer / API Gateway
+  nginx:
+    image: nginx:alpine
+    container_name: voicelaw-ai-nginx
+    <<: *restart-policy
+    <<: *logging
+    ports:
+      - "${NGINX_PORT:-80}:80"
+      - "${NGINX_SSL_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/static:/usr/share/nginx/html:ro
+      - nginx_cache:/var/cache/nginx
+    networks:
+      - voicelaw-ai-network
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Background Task Worker
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: voicelaw-ai:latest
+    container_name: voicelaw-ai-worker
+    <<: *restart-policy
+    <<: *logging
+    command: ["celery", "-A", "src.worker", "worker", "--loglevel=info", "--concurrency=4"]
+    environment:
+      <<: *common-variables
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    volumes:
+      - voicelaw_ai_cache:/app/cache
+      - voicelaw_ai_logs:/app/logs
+      - voicelaw_ai_uploads:/app/uploads
+    networks:
+      - voicelaw-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  # ===================================================================
+  # DATABASE SERVICES
+  # ===================================================================
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: voicelaw-ai-postgres
+    <<: *restart-policy
+    <<: *logging
+    environment:
+      POSTGRES_DB: legal_intake
+      POSTGRES_USER: legal_ai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - voicelaw-ai-network
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legal_ai -d legal_intake"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # Redis Cache & Session Store
+  redis:
+    image: redis:7-alpine
+    container_name: voicelaw-ai-redis
+    <<: *restart-policy
+    <<: *logging
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - voicelaw-ai-network
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # ===================================================================
+  # MONITORING & OBSERVABILITY
+  # ===================================================================
+
+  # Prometheus Metrics Collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: voicelaw-ai-prometheus
+    <<: *restart-policy
+    <<: *logging
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=90d'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring
+      - voicelaw-ai-network
+
+  # Grafana Dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: voicelaw-ai-grafana
+    <<: *restart-policy
+    <<: *logging
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3001}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+
+  # Log Aggregation
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: voicelaw-ai-elasticsearch
+    <<: *restart-policy
+    <<: *logging
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    volumes:
+      - ./monitoring/elasticsearch/data:/usr/share/elasticsearch/data
+    networks:
+      - monitoring
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Log Visualization
+  kibana:
+    image: kibana:8.11.0
+    container_name: voicelaw-ai-kibana
+    <<: *restart-policy
+    <<: *logging
+    ports:
+      - "${KIBANA_PORT:-5601}:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_NAME: voicelaw-ai-kibana
+    networks:
+      - monitoring
+    depends_on:
+      - elasticsearch
+
+  # ===================================================================
+  # FRONTEND SERVICES
+  # ===================================================================
+
+  # Frontend Development Server
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      target: development
+    image: voicelaw-ai-frontend:dev
+    container_name: voicelaw-ai-frontend
+    profiles: ["frontend", "dev"]
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:${API_PORT:-8000}
+      - REACT_APP_WS_URL=ws://localhost:${API_PORT:-8000}
+      - CHOKIDAR_USEPOLLING=true
+    volumes:
+      - ./src/components:/app/src/components
+      - ./src/hooks:/app/src/hooks
+      - ./public:/app/public
+    networks:
+      - voicelaw-ai-network
+    depends_on:
+      - api
+
+  # ===================================================================
+  # DEVELOPMENT & TESTING SERVICES
+  # ===================================================================
+
+  # Development API (with hot reload)
+  api-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    image: voicelaw-ai:dev
+    container_name: voicelaw-ai-api-dev
+    profiles: ["dev"]
+    ports:
+      - "${API_DEV_PORT:-8001}:8000"
+    environment:
+      <<: *common-variables
+      DEBUG: "true"
+      FASTAPI_RELOAD: "true"
+      LOG_LEVEL: "debug"
+    volumes:
+      - .:/app
+      - voicelaw_ai_cache:/app/cache
+      - voicelaw_ai_logs:/app/logs
+    networks:
+      - voicelaw-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["/app/start-dev.sh"]
+
+  # Testing Service
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    image: voicelaw-ai:dev
+    container_name: voicelaw-ai-test
+    profiles: ["test"]
+    environment:
+      <<: *common-variables
+      DATABASE_URL: postgresql://legal_ai:test_password@postgres-test:5432/legal_intake_test
+    volumes:
+      - .:/app
+    networks:
+      - voicelaw-ai-network
+    command: ["pytest", "-v", "tests/"]
+    depends_on:
+      - postgres-test
+
+  # Test Database
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: voicelaw-ai-postgres-test
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: legal_intake_test
+      POSTGRES_USER: legal_ai
+      POSTGRES_PASSWORD: test_password
+    networks:
+      - voicelaw-ai-network
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  # ===================================================================
+  # SCALING SERVICES (for load testing)
+  # ===================================================================
+
+  # Additional API instances for scaling
+  api-2:
+    extends: api
+    container_name: voicelaw-ai-api-2
+    profiles: ["scale"]
+    ports:
+      - "8002:8000"
+
+  api-3:
+    extends: api
+    container_name: voicelaw-ai-api-3
+    profiles: ["scale"]
+    ports:
+      - "8003:8000"
+
+  api-4:
+    extends: api
+    container_name: voicelaw-ai-api-4
+    profiles: ["scale"]
+    ports:
+      - "8004:8000"
+
+  api-5:
+    extends: api
+    container_name: voicelaw-ai-api-5
+    profiles: ["scale"]
+    ports:
+      - "8005:8000"
+
+  # Additional workers for background processing
+  worker-2:
+    extends: worker
+    container_name: voicelaw-ai-worker-2
+    profiles: ["scale"]
+
+  worker-3:
+    extends: worker
+    container_name: voicelaw-ai-worker-3
+    profiles: ["scale"]
+
+  worker-4:
+    extends: worker
+    container_name: voicelaw-ai-worker-4
+    profiles: ["scale"]
+
+  # ===================================================================
+  # UTILITY SERVICES
+  # ===================================================================
+
+  # Database migration runner
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: voicelaw-ai:latest
+    container_name: voicelaw-ai-migrate
+    profiles: ["migrate"]
+    environment:
+      <<: *common-variables
+    volumes:
+      - ./sql/migrations:/app/migrations:ro
+    networks:
+      - voicelaw-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-c", "from src.api.natural_voice_backend import Base, engine; Base.metadata.create_all(bind=engine); print('Migration completed')"]
+
+  # Data backup service
+  backup:
+    image: postgres:15-alpine
+    container_name: voicelaw-ai-backup
+    profiles: ["backup"]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
+    volumes:
+      - ./backups:/backups
+    networks:
+      - voicelaw-ai-network
+    depends_on:
+      - postgres
+    command: |
+      sh -c "
+        mkdir -p /backups
+        pg_dump -h postgres -U legal_ai legal_intake > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql
+        echo 'Backup completed successfully'
+        echo 'Backup saved to: /backups/backup_'$$(date +%Y%m%d_%H%M%S)'.sql'
+      "
+
+  # SSL Certificate Generator
+  ssl-gen:
+    image: alpine:latest
+    container_name: voicelaw-ai-ssl-gen
+    profiles: ["ssl"]
+    volumes:
+      - ./nginx/ssl:/ssl
+    command: |
+      sh -c "
+        apk add --no-cache openssl
+        if [ ! -f /ssl/nginx-selfsigned.crt ]; then
+          echo 'Generating self-signed SSL certificates...'
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /ssl/nginx-selfsigned.key \
+            -out /ssl/nginx-selfsigned.crt \
+            -subj '/C=US/ST=State/L=City/O=VoiceLaw-AI/CN=localhost'
+          echo 'SSL certificates generated successfully'
+        else
+          echo 'SSL certificates already exist'
+        fi
+      "
+
+  # PodGPT Model Converter
+  podgpt-converter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: voicelaw-ai:latest
+    container_name: voicelaw-ai-podgpt-converter
+    profiles: ["convert"]
+    environment:
+      <<: *common-variables
+    volumes:
+      - podgpt_models:/app/data
+      - ./data/podgpt:/app/data/podgpt:ro
+    networks:
+      - voicelaw-ai-network
+    command: ["python", "src/api/convert_podgpt_legal.py", "--input-dir", "/app/data/podgpt", "--output-dir", "/app/data/legal_rag"]
+
+# ===================================================================
+# USAGE EXAMPLES AND COMMANDS
+# ===================================================================
+
+# Start production stack:
+# docker-compose up -d
+
+# Start with monitoring:
+# docker-compose up -d prometheus grafana
+
+# Start development environment:
+# docker-compose --profile dev up -d
+
+# Start with frontend:
+# docker-compose --profile frontend up -d
+
+# Scale API instances:
+# docker-compose --profile scale up -d
+
+# Run tests:
+# docker-compose --profile test up --abort-on-container-exit
+
+# Run database migration:
+# docker-compose --profile migrate up --abort-on-container-exit
+
+# Generate SSL certificates:
+# docker-compose --profile ssl up --abort-on-container-exit
+
+# Convert PodGPT models:
+# docker-compose --profile convert up --abort-on-container-exit
+
+# Create backup:
+# docker-compose --profile backup up --abort-on-container-exit
+
+# View logs:
+# docker-compose logs -f api
+
+# Monitor resource usage:
+# docker stats
+
+# Access containers:
+# docker-compose exec api bash
+# docker-compose exec postgres psql -U legal_ai -d legal_intake
+
+# Stop everything:
+# docker-compose down
+
+# Remove all data (destructive):
+# docker-compose down -v --remove-orphans
+
+# Health checks:
+# curl http://localhost:8000/api/health
+# curl http://localhost/health
+
+# Scaling examples:
+# docker-compose up --scale api=5 --scale worker=3
+# docker-compose --profile scale up -d
+
+# Environment-specific deployments:
+# ENVIRONMENT=development docker-compose --profile dev up -d
+# ENVIRONMENT=staging docker-compose up -d
+# ENVIRONMENT=production docker-compose up -d
