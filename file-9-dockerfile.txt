@@ -1,0 +1,128 @@
+# Dockerfile
+# Multi-stage build for Legal AI Intake System with PodGPT integration
+# Optimized for production scalability and minimal image size
+
+# ===================================================================
+# STAGE 1: Base Python Environment with System Dependencies
+# ===================================================================
+FROM python:3.11-slim as base
+
+# Set environment variables for Python
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Essential build tools
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    cmake \
+    pkg-config \
+    # Audio processing dependencies
+    ffmpeg \
+    libsndfile1 \
+    libasound2-dev \
+    portaudio19-dev \
+    libportaudio2 \
+    # PostgreSQL client libraries
+    libpq-dev \
+    postgresql-client \
+    # Redis tools
+    redis-tools \
+    # System utilities
+    curl \
+    wget \
+    git \
+    unzip \
+    # Cleanup
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ===================================================================
+# STAGE 2: Python Dependencies Installation
+# ===================================================================
+FROM base as dependencies
+
+# Copy requirements first for better Docker layer caching
+COPY requirements.txt .
+
+# Upgrade pip and install wheel for faster builds
+RUN pip install --upgrade pip setuptools wheel
+
+# Install PyTorch first (largest dependency)
+RUN pip install torch==2.1.0 torchaudio==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies
+RUN pip install -r requirements.txt
+
+# Install additional dependencies for containerized environment
+RUN pip install \
+    gunicorn==21.2.0 \
+    uvloop==0.19.0 \
+    httptools==0.6.1 \
+    python-multipart==0.0.6
+
+# ===================================================================
+# STAGE 3: Model Download and Preparation
+# ===================================================================
+FROM dependencies as models
+
+# Create directories for models and data
+RUN mkdir -p /app/models /app/data /app/cache
+
+# Download Whisper models (this will be cached in the layer)
+RUN python -c "import whisper; whisper.load_model('base')"
+RUN python -c "import whisper; whisper.load_model('small')"
+
+# Download spaCy models for NLP
+RUN python -m spacy download en_core_web_sm
+RUN python -m spacy download es_core_news_sm
+RUN python -m spacy download fr_core_news_sm
+RUN python -m spacy download de_core_news_sm
+
+# Download sentence transformers models
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords'); nltk.download('wordnet')"
+
+# ===================================================================
+# STAGE 4: Application Code
+# ===================================================================
+FROM models as application
+
+# Copy application code
+COPY src/ ./src/
+COPY convert_podgpt_legal.py .
+COPY natural_voice_backend.py ./src/api/
+
+# Copy configuration files
+COPY docker-compose.yml .
+COPY .env.example .env
+
+# Create necessary directories with proper permissions
+RUN mkdir -p \
+    /app/logs \
+    /app/uploads \
+    /app/temp \
+    /app/static \
+    /app/cache/whisper \
+    /app/cache/embeddings \
+    && chmod -R 755 /app/cache \
+    && chmod -R 755 /app/logs \
+    && chmod -R 755 /app/uploads \
+    && chmod -R 755 /app/temp
+
+# ===================================================================
+# STAGE 5: Frontend Build (Optional - for full-stack container)
+# ===================================================================
+FROM node:18-alpine as frontend
+
+WORKDIR /fronten
