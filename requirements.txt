@@ -1,8 +1,6 @@
 # requirements.txt
 # Complete Python dependencies for Legal AI Intake System
 # Based on PodGPT with advanced voice processing and lip sync
-from sentence_transformers import SentenceTransformer, util
-legalbert = SentenceTransformer("nlpaueb/legal-bert-base-uncased")
 
 # ===================================================================
 # CORE FRAMEWORK & API
