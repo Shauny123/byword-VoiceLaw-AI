@@ -130,7 +130,7 @@ tiktoken>=0.5.1
 # ===================================================================
 
 # Legal document processing
-law-ai>=0.2.0
+sentence-transformers>=2.2.2
 
 # Date and time parsing for legal documents
 dateparser>=1.2.0
